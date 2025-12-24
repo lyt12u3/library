@@ -1,18 +1,21 @@
 # loan_service.py
+import httpx
+import asyncio
+import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
-import requests
+from contextlib import asynccontextmanager
 import uvicorn
+import random
 
-# Імпорт конфігурації мережі
-from config import CATALOG_SERVICE_URL, READER_SERVICE_URL
+# --- ІНФРАСТРУКТУРНІ НАСТРОЙКИ (PZ4) ---
+SERVICE_NAME = "loans"
+SERVICE_HOST = "127.0.0.1"
+SERVICE_PORT = 8003
+DISCOVERY_URL = "http://127.0.0.1:8000"
 
-app = FastAPI(title="Loan Microservice (Orchestrator)")
-
-# --- 1. ШАР DTO (Data Transfer Objects) --- 
-# Міжсервісні та внутрішні моделі даних
-
+# --- 1. ШАР DTO ---
 class LoanCreateDTO(BaseModel):
     bookId: int
     readerId: int
@@ -23,111 +26,129 @@ class LoanReadDTO(BaseModel):
     readerId: int
     status: str  # "active" або "returned"
 
-# --- 2. ШАР REPOSITORY (Data Layer) --- 
-# Управління власною ізольованою базою даних видач
-
+# --- 2. ШАР REPOSITORY ---
 class LoanRepository:
     def __init__(self):
-        # БД замовлень/видач, доступна тільки цьому сервісу
         self._db = []
 
-    def save(self, loan_data: dict):
-        loan_data["id"] = len(self._db) + 1
-        loan_data["status"] = "active"
-        self._db.append(loan_data)
-        return loan_data
+    def save(self, data: dict):
+        data["id"] = len(self._db) + 1
+        data["status"] = "active"
+        self._db.append(data)
+        return data
 
-    def get_by_id(self, loan_id: int):
-        return next((l for l in self._db if l["id"] == loan_id), None)
+    def get_by_id(self, lid: int):
+        return next((l for l in self._db if l["id"] == lid), None)
 
-    def get_by_reader(self, reader_id: int):
-        return [l for l in self._db if l["readerId"] == reader_id]
+    def get_by_reader(self, rid: int):
+        return [l for l in self._db if l["readerId"] == rid]
 
     def get_all_active(self):
         return [l for l in self._db if l["status"] == "active"]
 
 repo = LoanRepository()
 
-# --- 3. ШАР SERVICE (Business Logic Layer) --- 
-# Оркестрація викликів до інших сервісів (IPC) та бізнес-логіка
-
+# --- 3. ШАР SERVICE (Динамічне виявлення та Логіка) ---
 class LoanBusinessService:
     @staticmethod
-    def create_loan(dto: LoanCreateDTO) -> LoanReadDTO:
-        """9. [Loan] Оформити видачу книги читачу"""
-        
-        # Критерій: Реалізовано синхронний виклик (REST over HTTP) 
-        # 1. Перевірка читача у Reader Service
-        try:
-            r_resp = requests.get(f"{READER_SERVICE_URL}/readers/{dto.readerId}")
-            if r_resp.status_code == 404:
-                raise HTTPException(status_code=404, detail="Reader not found in Reader Service")
-            
-            reader = r_resp.json()
-            if reader["status"] != "active":
-                raise HTTPException(status_code=400, detail="Reader is blocked")
-        except requests.exceptions.ConnectionError:
-            raise HTTPException(status_code=503, detail="Reader Service is unavailable")
-
-        # 2. Перевірка книги у Catalog Service
-        try:
-            b_resp = requests.get(f"{CATALOG_SERVICE_URL}/catalog/books/{dto.bookId}")
-            if b_resp.status_code == 404:
-                raise HTTPException(status_code=404, detail="Book not found in Catalog")
-            
-            book = b_resp.json()
-            if not book["available"]:
-                raise HTTPException(status_code=400, detail="Book is already loaned")
-        except requests.exceptions.ConnectionError:
-            raise HTTPException(status_code=503, detail="Catalog Service is unavailable")
-
-        # 3. Збереження видачі у локальну БД
-        new_loan = repo.save(dto.dict())
-
-        # 4. Зміна статусу книги у Catalog Service (Side Effect)
-        requests.put(f"{CATALOG_SERVICE_URL}/catalog/books/{dto.bookId}/status", params={"available": False})
-        
-        return LoanReadDTO(**new_loan)
+    async def get_service_url(logic_name: str):
+        """
+        Реалізація критерію 'Рефакторинг виклику': 
+        отримання адреси за логічним ім'ям через Discovery.
+        """
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.get(f"{DISCOVERY_URL}/services/{logic_name}")
+                instances = resp.json()
+                if not instances:
+                    raise HTTPException(status_code=503, detail=f"Сервіс {logic_name} не знайдено в реєстрі")
+                
+                # Балансування навантаження на стороні клієнта 
+                instance = random.choice(instances)
+                return f"http://{instance['host']}:{instance['port']}"
+            except Exception as e:
+                if isinstance(e, HTTPException): raise e
+                raise HTTPException(status_code=503, detail="Discovery Service недоступний")
 
     @staticmethod
-    def return_loan(loan_id: int):
-        """10. [Loan] Повернути книгу"""
-        loan = repo.get_by_id(loan_id)
-        if not loan or loan["status"] == "returned":
-            raise HTTPException(status_code=404, detail="Active loan record not found")
-
-        # Оновлення статусу в локальній БД
-        loan["status"] = "returned"
-
-        # Повернення книги в доступ у Catalog Service
-        requests.put(f"{CATALOG_SERVICE_URL}/catalog/books/{loan['bookId']}/status", params={"available": True})
+    async def issue_book(dto: LoanCreateDTO):
+        """9. [Loan] Оформити видачу книги (Оркестрація)"""
         
-        return {"message": "Book successfully returned"}
+        # 1. Знаходимо Reader Service динамічно
+        reader_api = await LoanBusinessService.get_service_url("readers")
+        r_resp = requests.get(f"{reader_api}/readers/{dto.readerId}")
+        
+        if r_resp.status_code != 200 or r_resp.json()["status"] != "active":
+            raise HTTPException(status_code=400, detail="Читач заблокований або не існує")
 
-# --- 4. ШАР CONTROLLER (API Layer) --- 
+        # 2. Знаходимо Catalog Service динамічно
+        catalog_api = await LoanBusinessService.get_service_url("catalog")
+        b_resp = requests.get(f"{catalog_api}/catalog/books/{dto.bookId}")
+        
+        if b_resp.status_code != 200 or not b_resp.json()["available"]:
+            raise HTTPException(status_code=400, detail="Книга недоступна")
 
-@app.post("/loans", response_model=LoanReadDTO, status_code=201)
-def create_loan(dto: LoanCreateDTO):
-    """Оформити видачу (Оркестрація через Catalog та Reader)"""
-    return LoanBusinessService.create_loan(dto)
+        # 3. Реєстрація видачі
+        loan = repo.save(dto.dict())
+        
+        # 4. Оновлення статусу книги в каталозі
+        requests.put(f"{catalog_api}/catalog/books/{dto.bookId}/status", params={"available": False})
+        
+        return loan
+
+# --- 4. ІНФРАСТРУКТУРНА ЛОГІКА (Discovery & Heartbeat) ---
+async def send_heartbeat():
+    while True:
+        async with httpx.AsyncClient() as client:
+            try:
+                await client.post(f"{DISCOVERY_URL}/heartbeat/{SERVICE_NAME}", 
+                                 params={"host": SERVICE_HOST, "port": SERVICE_PORT})
+            except Exception: pass
+        await asyncio.sleep(10)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Реєстрація при запуску
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(f"{DISCOVERY_URL}/register", 
+                             params={"name": SERVICE_NAME, "host": SERVICE_HOST, "port": SERVICE_PORT})
+            print(f"[{SERVICE_NAME}] Успішно зареєстровано")
+        except Exception as e:
+            print(f"[{SERVICE_NAME}] Помилка реєстрації: {e}")
+    
+    heartbeat_task = asyncio.create_task(send_heartbeat())
+    yield
+    heartbeat_task.cancel()
+
+app = FastAPI(title="Loan Microservice (PZ4 Orchestrator)", lifespan=lifespan)
+
+# --- 5. ШАР CONTROLLER (API Endpoints) ---
+@app.post("/loans", status_code=201)
+async def create_loan(dto: LoanCreateDTO):
+    return await LoanBusinessService.issue_book(dto)
 
 @app.put("/loans/{id}/return")
-def return_book(id: int):
-    """Зафіксувати повернення книги"""
-    return LoanBusinessService.return_loan(id)
+async def return_book(id: int):
+    """10. [Loan] Повернути книгу"""
+    loan = repo.get_by_id(id)
+    if not loan or loan["status"] == "returned":
+        raise HTTPException(status_code=404, detail="Активний запис не знайдено")
+    
+    catalog_api = await LoanBusinessService.get_service_url("catalog")
+    loan["status"] = "returned"
+    requests.put(f"{catalog_api}/catalog/books/{loan['bookId']}/status", params={"available": True})
+    return {"message": "Книгу успішно повернуто"}
 
-@app.get("/loans/history/{reader_id}", response_model=List[LoanReadDTO])
-def get_reader_history(reader_id: int):
+@app.get("/loans/history/{reader_id}")
+def get_history(reader_id: int):
     """11. [Loan] Історія запозичень читача"""
-    history = repo.get_by_reader(reader_id)
-    return [LoanReadDTO(**l) for l in history]
+    return repo.get_by_reader(reader_id)
 
-@app.get("/loans/active", response_model=List[LoanReadDTO])
-def get_active_loans():
-    """12. [Loan] Список книг на руках (активні)"""
-    active = repo.get_all_active()
-    return [LoanReadDTO(**l) for l in active]
+@app.get("/loans/active")
+def get_active():
+    """12. [Loan] Список книг на руках"""
+    return repo.get_all_active()
 
 if __name__ == "__main__":
-    # Запуск мікросервісу на порту 8003
-    uvicorn.run(app, host="127.0.0.1", port=8003)
+    uvicorn.run(app, host=SERVICE_HOST, port=SERVICE_PORT)
